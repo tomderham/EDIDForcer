@@ -15,7 +15,7 @@ import os
 private let logger = Logger(subsystem: "com.example.EDIDForcer", category: "ScreenDetector")
 
 final class ScreenDetector {
-    private var timer: Timer?
+    private var debounceWorkItem: DispatchWorkItem?
     var onDisplayReconfigured: (() -> Void)?
 
     private static let callback: CGDisplayReconfigurationCallBack = { displayID, flags, userInfo in
@@ -26,24 +26,32 @@ final class ScreenDetector {
         }
         let detector = Unmanaged<ScreenDetector>.fromOpaque(opaque).takeUnretainedValue()
 
-        guard flags.contains(.addFlag) || flags.contains(.enabledFlag) else {
-            logger.info("reconfiguration callback: ignored (no addFlag/enabledFlag)")
-            return
-        }
-        // This callback fires for any display's reconfiguration, including the
-        // built-in display — ignore those, we only care about external displays.
-        guard CGDisplayIsBuiltin(displayID) == 0 else {
-            logger.info("reconfiguration callback: ignored (display \(displayID, privacy: .public) is the built-in display)")
+        // Ignore intermediate notifications while reconfiguration is beginning.
+        // Wait until it completes (when beginConfigurationFlag is clear).
+        guard !flags.contains(.beginConfigurationFlag) else {
+            logger.info("reconfiguration callback: ignored (beginConfigurationFlag set)")
             return
         }
 
-        // Debounce: several reconfiguration notifications typically fire in a
-        // burst around a single physical connect event.
-        logger.info("reconfiguration callback: external display add/enable — (re)starting 1.5s debounce timer")
-        detector.timer?.invalidate()
-        detector.timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: false) { _ in
-            logger.info("debounce timer fired — invoking onDisplayReconfigured")
-            detector.onDisplayReconfigured?()
+        // Filter out purely internal display events unless the desktop shape changed
+        // (which often happens when an external display is attached or detached).
+        let isBuiltin = CGDisplayIsBuiltin(displayID) != 0
+        if isBuiltin && !flags.contains(.addFlag) && !flags.contains(.removeFlag) && !flags.contains(.desktopShapeChangedFlag) {
+            logger.info("reconfiguration callback: ignored (built-in display minor change)")
+            return
+        }
+
+        // Debounce on main queue: several reconfiguration notifications typically
+        // fire in a burst around a single physical connect/disconnect event.
+        logger.info("reconfiguration callback: display change (\(flags.rawValue, privacy: .public)) — scheduling 1.5s debounce on main queue")
+        DispatchQueue.main.async {
+            detector.debounceWorkItem?.cancel()
+            let workItem = DispatchWorkItem { [weak detector] in
+                logger.info("debounce timer fired — invoking onDisplayReconfigured")
+                detector?.onDisplayReconfigured?()
+            }
+            detector.debounceWorkItem = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: workItem)
         }
     }
 
@@ -56,7 +64,8 @@ final class ScreenDetector {
     func stop() {
         let userData = Unmanaged.passUnretained(self).toOpaque()
         CGDisplayRemoveReconfigurationCallback(Self.callback, userData)
-        timer?.invalidate()
+        debounceWorkItem?.cancel()
+        debounceWorkItem = nil
         logger.info("stopped — removed CGDisplayReconfigurationCallback")
     }
 }

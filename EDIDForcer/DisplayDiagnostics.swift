@@ -28,12 +28,31 @@ struct ColorModeInfo: CustomStringConvertible {
 struct ExternalDisplayInfo {
     let port: Int
     let name: String
+    let edidUUID: String?
+    let manufacturerID: String?
+    let productID: Int?
+    let alphanumericSerial: String?
     /// The active (IsPreferred) timing's ColorMode entries, sorted by score descending.
     /// Only the first entry reflects what's actually negotiated right now — the rest
     /// are lower-priority fallback options the DCP didn't pick.
     let colorModes: [ColorModeInfo]
 
     var negotiatedDepth: Int? { colorModes.first?.depth }
+
+    /// A stable identity key for this display, so EDID caching and verification
+    /// never confuse one monitor with another on the same port.
+    var persistentID: String {
+        if let uuid = edidUUID, !uuid.isEmpty {
+            return uuid
+        }
+        let mfg = manufacturerID ?? "UNKNOWN"
+        let prod = productID.map(String.init) ?? "0"
+        let serial = alphanumericSerial ?? ""
+        if !serial.isEmpty {
+            return "\(mfg):\(prod):\(serial)"
+        }
+        return "\(mfg):\(prod):\(name)"
+    }
 }
 
 struct DisplayDiagnostics {
@@ -71,9 +90,30 @@ struct DisplayDiagnostics {
                 logger.error("discoverExternalDisplays: couldn't parse a port index, falling back to enumeration order \(index, privacy: .public)")
                 return index
             }()
-            let name = productName(for: candidate) ?? "External Display #\(port)"
-            logger.info("discoverExternalDisplays: port \(port, privacy: .public) = \"\(name, privacy: .public)\" — \(modes.map(\.description).joined(separator: " | "), privacy: .public)")
-            displays.append(ExternalDisplayInfo(port: port, name: name, colorModes: modes))
+
+            let edidUUID = IORegistryEntryCreateCFProperty(candidate, "EDID UUID" as CFString, kCFAllocatorDefault, 0)?
+                .takeRetainedValue() as? String
+            let attributes = IORegistryEntryCreateCFProperty(candidate, "DisplayAttributes" as CFString, kCFAllocatorDefault, 0)?
+                .takeRetainedValue() as? NSDictionary
+            let product = attributes?["ProductAttributes"] as? NSDictionary
+            let manufacturerID = product?["ManufacturerID"] as? String
+            let productID = product?["ProductID"] as? Int
+            let alphanumericSerial = product?["AlphanumericSerialNumber"] as? String
+
+            let rawName = product?["ProductName"] as? String
+            let cleanName = rawName?.trimmingCharacters(in: .whitespaces)
+            let name = (cleanName != nil && !cleanName!.isEmpty) ? cleanName! : "External Display #\(port)"
+
+            logger.info("discoverExternalDisplays: port \(port, privacy: .public) = \"\(name, privacy: .public)\" (uuid=\(edidUUID ?? "nil", privacy: .public)) — \(modes.map(\.description).joined(separator: " | "), privacy: .public)")
+            displays.append(ExternalDisplayInfo(
+                port: port,
+                name: name,
+                edidUUID: edidUUID,
+                manufacturerID: manufacturerID,
+                productID: productID,
+                alphanumericSerial: alphanumericSerial,
+                colorModes: modes
+            ))
         }
         logger.info("discoverExternalDisplays: found \(displays.count, privacy: .public) external display(s) among \(seen, privacy: .public) candidate(s)")
         return displays.sorted { $0.port < $1.port }

@@ -64,6 +64,32 @@ enum EDIDPatcherError: Error, CustomStringConvertible {
     }
 }
 
+/// Identifies a physical display based on manufacturer, product code, serial, and name.
+struct EDIDIdentity: Equatable, CustomStringConvertible {
+    let manufacturer: String
+    let productCode: UInt16
+    let serialNumber: UInt32
+    let productName: String?
+    let alphanumericSerial: String?
+
+    var description: String {
+        let name = productName ?? "Unknown"
+        return "\(manufacturer) \(name) (code: \(productCode), s/n: \(alphanumericSerial ?? String(serialNumber)))"
+    }
+
+    /// Stable unique identifier for matching against display attributes
+    var persistentID: String {
+        let serial = alphanumericSerial ?? (serialNumber != 0 ? String(serialNumber) : "")
+        if !serial.isEmpty {
+            return "\(manufacturer):\(productCode):\(serial)"
+        } else if let name = productName, !name.isEmpty {
+            return "\(manufacturer):\(productCode):\(name)"
+        } else {
+            return "\(manufacturer):\(productCode)"
+        }
+    }
+}
+
 /// Which deterministic patches to apply, composed together into a single EDID.
 struct EDIDPatchOptions {
     var forceEightBpc = false
@@ -90,6 +116,62 @@ struct EDIDPatcher {
         let vid = edid[edid.startIndex + videoInputDefinitionOffset]
         guard (vid & 0x80) != 0 else { return nil } // bit 7: 1 = digital
         return EDIDBitDepth(rawValue: (vid >> 4) & 0b111)
+    }
+
+    /// Extracts the display identity (manufacturer, product code, serial, product name)
+    /// from an EDID base block (EDID 1.3 / 1.4).
+    static func identity(of edid: Data) -> EDIDIdentity? {
+        guard edid.count >= baseBlockSize else { return nil }
+        let baseStart = edid.startIndex
+        let bytes = [UInt8](edid[baseStart ..< baseStart + baseBlockSize])
+        // Verify EDID header: 00 FF FF FF FF FF FF 00
+        guard bytes[0] == 0x00 && bytes[7] == 0x00,
+              bytes[1] == 0xFF && bytes[2] == 0xFF &&
+              bytes[3] == 0xFF && bytes[4] == 0xFF &&
+              bytes[5] == 0xFF && bytes[6] == 0xFF else {
+            return nil
+        }
+
+        // Manufacturer ID: 2 bytes at offset 8-9, big-endian compressed ASCII (5 bits per char)
+        let mfg = (UInt16(bytes[8]) << 8) | UInt16(bytes[9])
+        guard let u1 = UnicodeScalar(((mfg >> 10) & 0x1F) + 64),
+              let u2 = UnicodeScalar(((mfg >> 5) & 0x1F) + 64),
+              let u3 = UnicodeScalar((mfg & 0x1F) + 64) else {
+            return nil
+        }
+        let manufacturer = "\(Character(u1))\(Character(u2))\(Character(u3))"
+
+        // Product Code: 2 bytes at offset 10-11, little-endian
+        let productCode = UInt16(bytes[10]) | (UInt16(bytes[11]) << 8)
+
+        // Serial Number: 4 bytes at offset 12-15, little-endian
+        let serialNumber = UInt32(bytes[12]) | (UInt32(bytes[13]) << 8) | (UInt32(bytes[14]) << 16) | (UInt32(bytes[15]) << 24)
+
+        // Parse 18-byte descriptors at offsets 54, 72, 90, 108
+        var productName: String?
+        var alphanumericSerial: String?
+        for offset in [54, 72, 90, 108] {
+            // Display descriptor starts with 0x0000 00
+            if bytes[offset] == 0x00 && bytes[offset + 1] == 0x00 && bytes[offset + 2] == 0x00 {
+                let tag = bytes[offset + 3]
+                let textBytes = bytes[(offset + 5)..<(offset + 18)]
+                let text = String(bytes: textBytes, encoding: .ascii)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines.union(.controlCharacters))
+                if tag == 0xFC, let text, !text.isEmpty {
+                    productName = text
+                } else if tag == 0xFF, let text, !text.isEmpty {
+                    alphanumericSerial = text
+                }
+            }
+        }
+
+        return EDIDIdentity(
+            manufacturer: manufacturer,
+            productCode: productCode,
+            serialNumber: serialNumber,
+            productName: productName,
+            alphanumericSerial: alphanumericSerial
+        )
     }
 
     /// Validates every 128-byte block's checksum sums to 0 mod 256 (the standard

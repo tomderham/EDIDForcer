@@ -30,12 +30,13 @@ enum FeatureStatus {
 /// One row of read-only UI status per connected external display.
 struct MonitorInfo: Identifiable {
     let port: Int
+    let persistentID: String
     var name: String
     var eightBitStatus: FeatureStatus = .disabled
     var hdrStripStatus: FeatureStatus = .disabled
     var vrrStripStatus: FeatureStatus = .disabled
 
-    var id: Int { port }
+    var id: String { persistentID }
 }
 
 @MainActor
@@ -52,7 +53,10 @@ final class AppState: ObservableObject {
     @Published var stripVRRSignaling = false
     @Published var monitors: [MonitorInfo] = []
 
-    private var realEDIDByPort: [Int: Data] = [:]
+    /// Cached hardware EDIDs keyed by display identity (persistentID), never
+    /// solely by port number, so swapping monitors on the same cable/port never
+    /// applies one display's EDID to another.
+    private var realEDIDByDisplay: [String: Data] = [:]
     private let detector = ScreenDetector()
 
     private var currentOptions: EDIDPatchOptions {
@@ -70,12 +74,16 @@ final class AppState: ObservableObject {
 
         detector.onDisplayReconfigured = { [weak self] in
             Task { @MainActor in
-                guard let self, !self.currentOptions.isNoop else { return }
-                // Applying an EDID triggers a reconfiguration event itself; `apply`
-                // skips the write when nothing changed, so it's safe to call
-                // unconditionally here without causing a feedback loop.
-                for monitor in self.monitors {
-                    self.apply(port: monitor.port)
+                guard let self else { return }
+                logger.info("onDisplayReconfigured: refreshing connected displays")
+                // Always refresh diagnostics first so additions and removals
+                // immediately reflect in the UI regardless of option states.
+                self.refreshDiagnostics()
+
+                guard !self.currentOptions.isNoop else { return }
+                let discovered = DisplayDiagnostics.discoverExternalDisplays()
+                for info in discovered {
+                    self.apply(for: info)
                 }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                     self?.refreshDiagnostics()
@@ -94,9 +102,13 @@ final class AppState: ObservableObject {
     /// feature against their live state. Ports that disconnected are dropped.
     func refreshDiagnostics() {
         let discovered = DisplayDiagnostics.discoverExternalDisplays()
+        let activeIDs = Set(discovered.map(\.persistentID))
+        // Evict cached EDIDs for any displays that are no longer connected
+        realEDIDByDisplay = realEDIDByDisplay.filter { activeIDs.contains($0.key) }
+
         monitors = discovered.map { info in
-            var monitor = MonitorInfo(port: info.port, name: info.name)
-            let sourceEDID = realEDIDByPort[info.port]
+            var monitor = MonitorInfo(port: info.port, persistentID: info.persistentID, name: info.name)
+            let sourceEDID = realEDIDByDisplay[info.persistentID]
 
             // 8-bit: verified via the DCP's actual negotiated color mode. Never
             // `.notNeeded` — the Video Input Definition byte always exists, so a
@@ -147,32 +159,60 @@ final class AppState: ObservableObject {
 
     /// Applies the current option set to every connected display.
     private func reapplyAll() {
-        for monitor in monitors {
-            apply(port: monitor.port)
+        let discovered = DisplayDiagnostics.discoverExternalDisplays()
+        for info in discovered {
+            apply(for: info)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             self?.refreshDiagnostics()
         }
     }
 
-    /// Computes the EDID for `port` from the enabled options (identity if none are
-    /// enabled) and writes it if it differs from what's currently live. Uses
-    /// `applyVirtualEDID` even for the identity case rather than
-    /// `DCPAVService.resetEDID()`, since the latter can trigger a heavier
-    /// renegotiation on some displays. `resetAllToHardwareDefaults()` exposes the
-    /// real reset for when the override should be fully released.
-    private func apply(port: Int) {
+    /// Validates whether the parsed EDID identity matches the connected framebuffer attributes.
+    private func isIdentity(_ identity: EDIDIdentity?, matching display: ExternalDisplayInfo) -> Bool {
+        guard let identity else { return false }
+        if let mfg = display.manufacturerID, !mfg.isEmpty, identity.manufacturer != mfg {
+            return false
+        }
+        if let pid = display.productID, pid != 0, Int(identity.productCode) != pid {
+            return false
+        }
+        if let edidName = identity.productName, !edidName.isEmpty,
+           !display.name.isEmpty, !display.name.starts(with: "External Display #") {
+            if edidName != display.name {
+                return false
+            }
+        }
+        return true
+    }
+
+    /// Computes the EDID for `display` from the enabled options (identity if none are
+    /// enabled) and writes it if it differs from what's currently live.
+    private func apply(for display: ExternalDisplayInfo) {
         do {
-            let service = try DCPAVService.openExternal(port: port)
+            let service = try DCPAVService.openExternal(port: display.port)
 
             let sourceEDID: Data
-            if let cached = realEDIDByPort[port] {
+            if let cached = realEDIDByDisplay[display.persistentID] {
                 sourceEDID = cached
             } else {
-                sourceEDID = try service.copyEDID()
-                realEDIDByPort[port] = sourceEDID
+                var currentEDID = try service.copyEDID()
+                let currentIdentity = EDIDPatcher.identity(of: currentEDID)
+
+                // Verify that currentEDID actually belongs to this display.
+                // If a virtual EDID from a previously connected monitor is still
+                // active in the DCP (e.g. from an unplugged display), reset to
+                // hardware defaults first so we get the true hardware EDID.
+                if !isIdentity(currentIdentity, matching: display) {
+                    logger.warning("apply: active EDID on port \(display.port, privacy: .public) (\(currentIdentity?.description ?? "unknown", privacy: .public)) does not match display \"\(display.name, privacy: .public)\" (\(display.persistentID, privacy: .public)) — resetting port to hardware defaults")
+                    try service.resetEDID()
+                    currentEDID = try service.copyEDID()
+                }
+
+                sourceEDID = currentEDID
+                realEDIDByDisplay[display.persistentID] = sourceEDID
                 if let depth = EDIDPatcher.currentBitDepth(of: sourceEDID) {
-                    logger.info("apply(port: \(port, privacy: .public)): real EDID declares \(depth.description, privacy: .public)")
+                    logger.info("apply(port: \(display.port, privacy: .public), display: \"\(display.name, privacy: .public)\"): hardware EDID declares \(depth.description, privacy: .public)")
                 }
             }
 
@@ -182,16 +222,16 @@ final class AppState: ObservableObject {
             // safe to call `apply` unconditionally on every reconfiguration event,
             // including the one our own writes trigger.
             let liveEDID = try service.copyEDID()
-            logger.info("apply(port: \(port, privacy: .public)): desired declares \(EDIDPatcher.currentBitDepth(of: desired)?.description ?? "?", privacy: .public), live declares \(EDIDPatcher.currentBitDepth(of: liveEDID)?.description ?? "?", privacy: .public)")
+            logger.info("apply(port: \(display.port, privacy: .public)): desired declares \(EDIDPatcher.currentBitDepth(of: desired)?.description ?? "?", privacy: .public), live declares \(EDIDPatcher.currentBitDepth(of: liveEDID)?.description ?? "?", privacy: .public)")
             guard liveEDID != desired else {
-                logger.info("apply(port: \(port, privacy: .public)): live EDID already matches desired state, skipping")
+                logger.info("apply(port: \(display.port, privacy: .public)): live EDID already matches desired state, skipping")
                 return
             }
 
             try service.applyVirtualEDID(desired)
-            logger.info("Applied EDID successfully to port \(port, privacy: .public) (isNoop=\(self.currentOptions.isNoop, privacy: .public))")
+            logger.info("Applied EDID successfully to port \(display.port, privacy: .public) for display \"\(display.name, privacy: .public)\" (isNoop=\(self.currentOptions.isNoop, privacy: .public))")
         } catch {
-            logger.error("Apply failed for port \(port, privacy: .public): \(String(describing: error), privacy: .public)")
+            logger.error("Apply failed for port \(display.port, privacy: .public): \(String(describing: error), privacy: .public)")
         }
     }
 
@@ -199,15 +239,17 @@ final class AppState: ObservableObject {
     /// `DCPAVService.resetEDID()` — a heavier operation than `apply`'s identity
     /// write, but the one way to be certain no override is active at all.
     func resetAllToHardwareDefaults() {
-        for monitor in monitors {
+        let ports = DCPAVService.discoverExternalPorts()
+        for port in ports {
             do {
-                let service = try DCPAVService.openExternal(port: monitor.port)
+                let service = try DCPAVService.openExternal(port: port)
                 try service.resetEDID()
-                logger.info("resetAllToHardwareDefaults: released virtual EDID for port \(monitor.port, privacy: .public)")
+                logger.info("resetAllToHardwareDefaults: released virtual EDID for port \(port, privacy: .public)")
             } catch {
-                logger.error("resetAllToHardwareDefaults: failed for port \(monitor.port, privacy: .public): \(String(describing: error), privacy: .public)")
+                logger.error("resetAllToHardwareDefaults: failed for port \(port, privacy: .public): \(String(describing: error), privacy: .public)")
             }
         }
+        realEDIDByDisplay.removeAll()
         forceEightBit = false
         stripHDRMetadata = false
         stripVRRSignaling = false
